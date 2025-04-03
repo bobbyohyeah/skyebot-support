@@ -1,13 +1,31 @@
 # SkyeBrowse Customer Inquiry Responder
 
-This script uses Google Gemini (via the `google-genai` library) and context documents stored in Google Drive to generate responses to customer support inquiries about SkyeBrowse. It can download the necessary training documents from Google Drive or use local copies if available.
+**Overview:**
+
+This script automates customer support email responses for SkyeBrowse using Google Gemini and context documents from Google Drive.
+
+1.  **Input:** Takes a customer inquiry either via a command-line argument (`-i`) or through an interactive prompt if no argument is given. Typing 'q' quits the interactive prompt.
+2.  **Context Preparation:**
+    *   Fetches Google Drive file IDs from environment variables (prefixed with `GDRIVE_`).
+    *   If the `-d` flag is used or local files are missing, it authenticates with the Google Drive API (using `credentials.json` and `token.json`), downloads specified files, and exports Google Docs/Sheets to text/CSV format respectively, saving them in a local `drive/` directory.
+    *   If the `-d` flag is *not* used and local files exist in `drive/`, it uses those files.
+    *   Uploads the prepared local files (downloaded or pre-existing) to the Google GenAI API for context.
+3.  **Response Generation:**
+    *   Initializes the Google GenAI client using an API key from the `.env` file.
+    *   Constructs a prompt for the Gemini model (`gemini-2.0-flash` specified in the code), including a system instruction (defining the persona as a SkyeBrowse support specialist) and the user's inquiry, along with the uploaded context files.
+    *   Sends the request to the Gemini API and streams the response back.
+4.  **Output:**
+    *   Prints the generated email response to the console in real-time as it streams.
+    *   After generation, displays a summary including the time taken and token usage (prompt, candidates, total) if available from the API metadata.
+5.  **Looping:** Continues to prompt for new inquiries until the user quits.
+
 
 ## Setup
 
 1.  **Clone the repository:**
     ```bash
-    git clone <repository-url>
-    cd <repository-directory>
+    git clone https://github.com/bobbyohyeah/skyebot-support
+    cd skyebot-support
     ```
 2.  **Install dependencies (tested on python 3.11):**
     ```bash
@@ -44,7 +62,7 @@ This script uses Google Gemini (via the `google-genai` library) and context docu
     ```bash
     python main.py
     ```
-    *(The script will prompt you to enter the inquiry.)*
+    *(You will be prompted to enter the inquiry.)*
 
 *   **Run interactively, forcing download from Google Drive:**
     ```bash
@@ -78,7 +96,5 @@ The required Python packages are listed in `requirements.txt`. Key dependencies 
 
 *   `credentials.json`: Your downloaded Google Cloud OAuth 2.0 credentials. Required for Google Drive API access.
 *   `token.json`: Stores Google Drive API access and refresh tokens after successful authorization. Automatically generated/updated.
-*   `.env`: Stores your `GEMINI_API_KEY`.
+*   `.env`: Stores your `GEMINI_API_KEY` and other files to download from Google Drive. The Google Drive files are the url of it, so the file at `https://docs.google.com/document/d/1yRAq8aqxiOcQGkZ6hHv-xdZffZ2KPIGihmekzjKsyA0/edit?tab=t.0` would be reflected as `1yRAq8aqxiOcQGkZ6hHv-xdZffZ2KPIGihmekzjKsyA0`.
 *   `drive/`: Directory where Google Drive context files are downloaded (if using the `-d` flag or if they exist locally).
-
-*(These files/directories are listed in `.gitignore` to prevent accidental commits.)*
