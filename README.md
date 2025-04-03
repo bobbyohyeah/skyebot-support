@@ -1,4 +1,4 @@
-# SkyeBrowse Customer Inquiry Responder
+# SkyeBot Support
 
 **Overview:**
 
