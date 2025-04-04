@@ -11,6 +11,7 @@ from google.genai import types
 from googleapiclient.errors import HttpError
 import argparse
 import time
+import concurrent.futures
 
 load_dotenv()
 
@@ -154,16 +155,28 @@ def prepare_context_files(download_flag):
     # --- Upload Files to GenAI API --- (Do this ONCE)
     print("--- Uploading Files to GenAI API --- ")
     genai_file_parts = []
-    for name, file_path in processed_files_paths.items():
+
+    def upload_single_file(name, file_path):
         try:
-            print(f"Uploading {file_path} to GenAI API...")
+            print(f"Uploading {file_path} ({name}) to GenAI API...")
             genai_file = client.files.upload(file=file_path)
-            genai_file_parts.append(types.Part.from_uri(file_uri=genai_file.uri, mime_type=genai_file.mime_type))
             print(f"Successfully uploaded {name} ({genai_file.name})")
+            return types.Part.from_uri(file_uri=genai_file.uri, mime_type=genai_file.mime_type)
         except Exception as e:
-             print(f"Failed to upload {file_path} to GenAI: {e}")
-             # Decide if you want to continue without this file or abort
-             # Continuing for now
+             print(f"Failed to upload {file_path} ({name}) to GenAI: {e}")
+             return None # Return None on failure
+
+    # Use ThreadPoolExecutor for concurrent uploads
+    uploaded_parts = []
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        # Create a future for each file upload
+        future_to_name = {executor.submit(upload_single_file, name, path): name for name, path in processed_files_paths.items()}
+        for future in concurrent.futures.as_completed(future_to_name):
+            result = future.result()
+            if result: # Only add successful uploads
+                uploaded_parts.append(result)
+
+    genai_file_parts = uploaded_parts # Assign the collected parts
 
     if not genai_file_parts:
         print("No files were successfully uploaded to GenAI. Aborting.")
@@ -187,8 +200,8 @@ def generate_response(client, file_parts, inquiry_text):
         return None
 
     try:
-        model = "gemini-2.0-flash" # this is for support chat bot
-        # model = "gemini-2.5-pro-exp-03-25" # this is for email chat bot
+        # model = "gemini-2.0-flash" # this is for support chat bot
+        model = "gemini-2.5-pro-exp-03-25" # this is for email chat bot
 
         # Construct parts list including the pre-uploaded files and the new inquiry
         current_parts = []
