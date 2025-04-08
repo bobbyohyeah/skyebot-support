@@ -20,7 +20,7 @@ import argparse # Added for command-line arguments
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-load_dotenv()
+load_dotenv(override=True)
 
 # --- Global Variables for GenAI Client and Files ---
 genai_client = None

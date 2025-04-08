@@ -4,3 +4,4 @@ venv
 drive
 drive_worker
 .env
+training
