@@ -1,7 +1,8 @@
-credentials.json
-token.json
 venv
 drive
 drive_worker
 .env
 training
+keys
+*.json
+*.mp3

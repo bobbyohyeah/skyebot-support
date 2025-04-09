@@ -13,10 +13,155 @@ from google.genai import types
 from googleapiclient.errors import HttpError
 import argparse
 import time
+import pygame
+from pydub import AudioSegment
+import httpx
+import sounddevice as sd
+import soundfile as sf
+from google.cloud import speech
+import re # Add import for regex
 extension = "txt"
-format = "email" # chat or email
+format = "voice" # voice or chat or email
 
 load_dotenv(override=True)
+
+# --- Audio Recording Settings ---
+SAMPLE_RATE = 16000 # Sample rate for recording (Hz) - common for STT
+CHANNELS = 1       # Mono audio
+AUDIO_FILENAME = "temp_input_audio.wav"
+
+# --- Initialize Pygame Mixer ---
+try:
+    pygame.mixer.init(frequency=24000, size=-16, channels=1)
+    print("Pygame mixer initialized successfully.")
+except pygame.error as e:
+    print(f"Error initializing pygame mixer: {e}. Audio output will be disabled.")
+    pygame = None # Disable pygame if initialization fails
+
+# --- Text-to-Speech Function ---
+def text_to_speech(text):
+    """Convert text to audio using Google TTS service"""
+    tts_api_key = os.environ.get("GOOGLE_TTS_API_KEY")
+    if not tts_api_key:
+        print("Warning: GOOGLE_TTS_API_KEY environment variable not set. Cannot perform text-to-speech.")
+        return None
+    if not pygame: # Check if pygame initialization failed
+        print("Warning: Pygame not initialized. Skipping text-to-speech.")
+        return None
+
+    try:
+        response = httpx.post(
+            "https://texttospeech.googleapis.com/v1/text:synthesize",
+            headers={"X-Goog-Api-Key": tts_api_key},
+            json={
+                "input": {"text": text},
+                "voice": {"languageCode": "en-US", "name": "en-US-Chirp3-HD-Leda"},
+                "audioConfig": {
+                    "audioEncoding": "LINEAR16",
+                    "speakingRate": 1
+                }
+            },
+            timeout=20.0
+        )
+        response.raise_for_status() # Raise an exception for bad status codes
+        audio_content_base64 = response.json().get('audioContent')
+        if audio_content_base64:
+            import base64
+            return base64.b64decode(audio_content_base64)
+        else:
+            print("Warning: No audio content received from TTS API.")
+            return None
+    except httpx.RequestError as exc:
+        print(f"Error during TTS request: {exc}")
+        return None
+    except httpx.HTTPStatusError as exc:
+        print(f"TTS API returned error status: {exc.response.status_code} - {exc.response.text}")
+        return None
+    except Exception as e:
+        print(f"An unexpected error occurred in text_to_speech: {e}")
+        return None
+
+# --- Audio Streaming Function ---
+def stream_audio(audio_data, tts_channel):
+    """Stream audio chunk using pygame by queueing on a channel."""
+    if not audio_data or not pygame:
+        return # Don't proceed if no audio data or pygame is disabled
+
+    try:
+        audio = AudioSegment(
+            data=audio_data,
+            sample_width=2, # 16 bits = 2 bytes
+            frame_rate=24000,
+            channels=1
+        )
+        # Apply a short fade-in to reduce popping
+        fade_ms = 10 # milliseconds
+        audio_faded = audio.fade_in(fade_ms)
+        
+        sound = pygame.mixer.Sound(buffer=audio_faded.raw_data)
+
+        if tts_channel:
+            # Queue the sound on the dedicated channel
+            tts_channel.queue(sound)
+            # Optional: Add a small buffer time maybe? 
+            # No explicit wait needed here, channel handles playback.
+        else:
+            # Fallback if channel wasn't reserved (e.g., pygame init issue)
+            print("Warning: TTS channel not available. Playing sound directly.")
+            sound.play()
+            # Fallback requires waiting if no channel queueing
+            while pygame.mixer.get_busy(): 
+                pygame.time.Clock().tick(10)
+
+    except Exception as e:
+        print(f"Error playing/queueing audio chunk: {e}")
+
+# --- Audio Recording Function ---
+def record_audio(filename=AUDIO_FILENAME, duration=5, samplerate=SAMPLE_RATE, channels=CHANNELS):
+    """Records audio from the microphone for a specified duration."""
+    print(f"Recording for {duration} seconds... Speak now!")
+    try:
+        recording = sd.rec(int(duration * samplerate), samplerate=samplerate, channels=channels, dtype='int16')
+        sd.wait() # Wait until recording is finished
+        sf.write(filename, recording, samplerate)
+        print(f"Recording saved to {filename}")
+        return filename
+    except Exception as e:
+        print(f"Error during audio recording: {e}")
+        return None
+
+# --- Speech-to-Text Function ---
+def speech_to_text(audio_file_path):
+    """Transcribes audio file using Google Cloud Speech-to-Text."""
+    # Requires GOOGLE_APPLICATION_CREDENTIALS environment variable to be set
+    # to the path of your service account key file.
+    try:
+        client = speech.SpeechClient()
+        with io.open(audio_file_path, "rb") as audio_file:
+            content = audio_file.read()
+
+        audio = speech.RecognitionAudio(content=content)
+        config = speech.RecognitionConfig(
+            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+            sample_rate_hertz=SAMPLE_RATE,
+            language_code="en-US",
+        )
+
+        print("Transcribing audio...")
+        response = client.recognize(config=config, audio=audio)
+
+        if not response.results:
+            print("Transcription failed: No speech detected or recognized.")
+            return None
+
+        transcript = "".join(result.alternatives[0].transcript for result in response.results)
+        print(f"Transcription: {transcript}")
+        return transcript
+
+    except Exception as e:
+        print(f"Error during speech-to-text: {e}")
+        print("Ensure GOOGLE_APPLICATION_CREDENTIALS is set correctly and Speech-to-Text API is enabled.")
+        return None
 
 # --- Argument Parsing ---
 def parse_arguments():
@@ -32,7 +177,7 @@ SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
 def get_drive_service():
     creds = None
-    if os.path.exists("token.json"):
+    if os.path.exists("./keys/token.json"):
         creds = Credentials.from_authorized_user_file("./keys/token.json", SCOPES)
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
@@ -265,99 +410,130 @@ def prepare_context_files(download_flag):
     return client, genai_file_parts
 
 
-def generate_response(client, file_parts, inquiry_text, model_name, conversation_history):
+def generate_response(client, file_parts, inquiry_text, model_name, conversation_history, tts_channel):
     """Generates a response, maintaining conversation history."""
     print("\n📤 Inquiry\n")
     print(inquiry_text + "\n")
-    print("\n🔍 Response\n")
 
     last_usage_metadata = None
     response_text = ""
+    text_buffer = "" # Buffer for incoming text
+    # Removed tts_buffer and sentence counter
 
     if not client:
         print("GenAI client is not available.")
-        # Return None for metadata and the unchanged history
         return None, conversation_history
 
     try:
-        # Use the model_name argument passed to the function
+        # Select model
         if model_name == 'flash':
-            model_str = "models/gemini-2.0-flash-001"
+            model_str = "models/gemini-1.5-flash-latest"
         elif model_name == 'flash-lite':
-            model_str = "models/gemini-2.0-flash-lite-001"
+            model_str = "models/gemini-1.5-flash-latest" # Or a specific lite model if available
         elif model_name == 'pro':
-            model_str = "models/gemini-2.5-pro-exp-03-25"
+             model_str = "models/gemini-1.5-pro-latest"
         else:
-            # Default to pro if unspecified or invalid
-            model_str = "models/gemini-2.5-pro-exp-03-25"
+            model_str = "models/gemini-1.5-pro-latest"
             print(f"Warning: Invalid model '{model_name}' specified. Defaulting to {model_str}")
 
-        # --- Construct the prompt based on history ---
-        if not conversation_history: # First turn
+        # Construct initial prompt or use history
+        if not conversation_history:
             try:
                 with open("sys_prompts.json", "r") as f:
                     sys_prompts = json.load(f)
             except FileNotFoundError:
                 print("Error: sys_prompts.json not found. Exiting.")
                 exit()
-            
             if format == "chat":
                 initial_user_parts = [types.Part.from_text(text=sys_prompts["system_instruction_chat"])]
-            elif format == "email":
-                initial_user_parts = [types.Part.from_text(text=sys_prompts["system_instruction_email"])]
             elif format == "voice":
                 initial_user_parts = [types.Part.from_text(text=sys_prompts["system_instruction_voice"])]
             else:
                 initial_user_parts = [types.Part.from_text(text=sys_prompts["system_instruction_chat"])]
-
+             
             if file_parts:
-                initial_user_parts.extend(file_parts)
-            initial_user_parts.append(types.Part.from_text(text="--- End of Provided Documents ---"))
+                 initial_user_parts.extend(file_parts)
             initial_user_parts.append(types.Part.from_text(text="--- User Inquiry ---"))
             initial_user_parts.append(types.Part.from_text(text=inquiry_text))
-
-            # Add the combined initial prompt as the first user message
             conversation_history.append(types.Content(role="user", parts=initial_user_parts))
-            contents = conversation_history # Send the history including the new message
-
-        else: # Subsequent turn
-            # Append only the new user inquiry
+            contents = conversation_history
+        else:
             conversation_history.append(types.Content(role="user", parts=[types.Part.from_text(text=inquiry_text)]))
-            contents = conversation_history # Send the whole history
+            contents = conversation_history
 
-        # Define generation config
         generate_content_config = types.GenerateContentConfig(
-            temperature=0,
+            temperature=1,
             response_mime_type="text/plain",
         )
 
         stream = client.models.generate_content_stream(
             model=model_str,
-            contents=contents, # Send the potentially updated history
+            contents=contents,
             config=generate_content_config,
         )
 
+        print("\n🔊 Assistant:", end=" ")
         for chunk in stream:
             if chunk.text:
-                print(chunk.text, end="")
+                print(chunk.text, end="", flush=True)
                 response_text += chunk.text
+                text_buffer += chunk.text
+
+                # Process based on punctuation/length for streaming TTS
+                search_start = 0
+                while True:
+                    match = re.search(r"[.?!](?=\s|$)", text_buffer[search_start:])
+                    if match:
+                        current_end_pos = search_start + match.end()
+                        segment_to_process = text_buffer[:current_end_pos]
+                        
+                        # Heuristic check (e.g., > 15 chars or contains punctuation)
+                        if len(segment_to_process) > 15 or re.search(r"[.?!]", segment_to_process):
+                            audio_data = text_to_speech(segment_to_process.strip())
+                            if audio_data:
+                                stream_audio(audio_data, tts_channel) # Pass channel
+                            
+                            text_buffer = text_buffer[current_end_pos:]
+                            search_start = 0
+                        else:
+                            # Segment too short, wait for more text
+                            search_start = current_end_pos
+                    else:
+                        break # No more terminators
+
             if hasattr(chunk, 'usage_metadata') and chunk.usage_metadata:
                 last_usage_metadata = chunk.usage_metadata
 
-        # Append the complete model response to the history
+        # Process any final fragment left in the buffer
+        if text_buffer.strip():
+            audio_data = text_to_speech(text_buffer.strip())
+            if audio_data:
+                stream_audio(audio_data, tts_channel) # Pass channel
+        print() # Newline after response
+
         if response_text:
-             conversation_history.append(types.Content(role="model", parts=[types.Part.from_text(text=response_text)]))
+            conversation_history.append(types.Content(role="model", parts=[types.Part.from_text(text=response_text)]))
 
     except Exception as e:
         print(f"\nAn error occurred during generation: {e}")
-        # Don't append model response if there was an error
 
-    # Return metadata and the updated history
     return last_usage_metadata, conversation_history
 
 if __name__ == "__main__":
     args = parse_arguments()
     model_name = args.model
+
+    # Initialize Pygame and reserve a channel for TTS playback
+    tts_channel = None
+    if pygame: # Check if pygame was initialized successfully
+        try:
+            # Allocate a specific channel (e.g., channel 0)
+            tts_channel = pygame.mixer.Channel(0) 
+            print("Reserved Pygame mixer channel 0 for TTS playback.")
+        except pygame.error as e:
+            print(f"Error getting pygame channel: {e}. Audio queueing might not work.")
+            # Continue without a dedicated channel? Or handle differently?
+            # For now, stream_audio will need to handle tts_channel being None
 
     # Prepare files and client ONCE
     genai_client, prepared_file_parts = prepare_context_files(args.download)
@@ -376,18 +552,31 @@ if __name__ == "__main__":
             args.inquiry = None # Clear it so we prompt next time
         else:
             try:
-                inquiry_to_use = input("\nEnter prompt (or press 'q' to quit): ")
+                user_input = input("\nEnter text prompt, press Enter to record audio, or 'q' to quit: ")
+                if user_input.lower() == 'q':
+                    print("Exiting.")
+                    break
+                elif not user_input: # User pressed Enter, initiate recording
+                    audio_path = record_audio() # Record for default duration
+                    if audio_path:
+                        inquiry_to_use = speech_to_text(audio_path)
+                        # Clean up the temporary audio file
+                        try:
+                            os.remove(audio_path)
+                        except OSError as e:
+                            print(f"Warning: Could not remove temp audio file {audio_path}: {e}")
+                    else:
+                        inquiry_to_use = None # Recording failed
+                else:
+                    inquiry_to_use = user_input # Use text input
+
             except EOFError: # Handle Ctrl+D
                 print("\nExiting.")
                 break
 
         if not inquiry_to_use:
-            print("Inquiry cannot be empty. Please try again or press 'q' to quit.")
+            print("No input received or transcription failed. Please try again or press 'q' to quit.")
             continue
-
-        if inquiry_to_use.lower() == 'q':
-            print("Exiting.")
-            break
 
         # Process this single inquiry, passing and updating history
         start_time = time.time()
@@ -396,7 +585,8 @@ if __name__ == "__main__":
             prepared_file_parts,
             inquiry_to_use,
             args.model,
-            conversation_history # Pass current history
+            conversation_history, # Pass current history
+            tts_channel # Pass the reserved channel
         )
         end_time = time.time()
         duration = end_time - start_time
